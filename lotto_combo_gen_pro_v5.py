@@ -8,6 +8,7 @@ Goals vs v4:
 - Larger candidate POOL with softmax sampling then GREEDY COVER selection to
   maximize weighted coverage of hot numbers, pairs, and triplets while keeping
   high diversity between chosen combos.
+- Multi-start greedy + local-search refinement to maximize coverage quality.
 - Optional light AUTO‑TUNE over the last K draws to pick good knobs for your data.
 - Stronger anti‑similarity to recent draws and within‑set overlap constraints.
 - Backtest (holdout-at-0) kept and expanded.
@@ -483,6 +484,103 @@ def select_greedy_cover(pool: List[tuple], df_view: pd.DataFrame, main_cols: Lis
     return selected[:args.total_needed]
 
 
+def set_quality(combos: List[tuple], prefs: Prefs, args) -> float:
+    if not combos:
+        return -1e18
+    avg_score = float(np.mean([combo_score(c, prefs, args) for c in combos]))
+    covered_nums: Set[int] = set()
+    covered_pairs: Set[tuple] = set()
+    covered_trips: Set[tuple] = set()
+    for c in combos:
+        covered_nums.update(c)
+        for a, b in combinations(c, 2):
+            covered_pairs.add((min(a, b), max(a, b)))
+        if prefs.trip:
+            for t in combinations(c, 3):
+                covered_trips.add(tuple(sorted(t)))
+
+    cov_num = (sum(max(0.0, prefs.num.get(v, 0.0)) for v in covered_nums)
+               / max(1, len(covered_nums)))
+    cov_pair = (sum(max(0.0, prefs.pair.get(p, 0.0)) for p in covered_pairs)
+                / max(1, len(covered_pairs)))
+    cov_trip = 0.0
+    if prefs.trip:
+        cov_trip = (sum(max(0.0, prefs.trip.get(t, 0.0)) for t in covered_trips)
+                    / max(1, len(covered_trips)))
+    spread_bonus = float(np.mean([(max(c) - min(c)) / max(1.0, args.num_max) for c in combos]))
+
+    return (avg_score
+            + 0.45 * cov_num
+            + 0.30 * cov_pair
+            + (0.20 * cov_trip if prefs.trip else 0.0)
+            + 0.05 * spread_bonus)
+
+
+def refine_combos(combos: List[tuple], prefs: Prefs, args, rng: np.random.Generator) -> List[tuple]:
+    if args.refine_iters <= 0 or not combos:
+        return combos
+
+    refined = [list(c) for c in combos]
+    top_sorted = sorted(range(1, args.num_max + 1), key=lambda n: prefs.num.get(n, 0.0), reverse=True)
+    top_limit = max(6, min(args.num_max, args.refine_candidates))
+    top_candidates = top_sorted[:top_limit]
+
+    for _ in range(args.refine_iters):
+        changed = False
+        for idx, combo in enumerate(refined):
+            best_score = combo_score(tuple(sorted(combo)), prefs, args)
+            best_variant = combo[:]
+            others = [set(refined[j]) for j in range(len(refined)) if j != idx]
+
+            random_candidates = list(rng.choice(range(1, args.num_max + 1), size=min(6, args.num_max), replace=False))
+            candidates = list(dict.fromkeys(top_candidates + random_candidates))
+
+            for drop_pos in range(len(combo)):
+                original_val = combo[drop_pos]
+                for candidate_val in candidates:
+                    if candidate_val == original_val:
+                        continue
+                    trial = combo[:]
+                    trial[drop_pos] = int(candidate_val)
+                    trial_sorted = sorted(set(trial))
+                    if len(trial_sorted) != 6:
+                        continue
+                    if not all(1 <= v <= args.num_max for v in trial_sorted):
+                        continue
+                    if any(len(set(trial_sorted) & other) >= args.dedupe_k for other in others):
+                        continue
+                    score = combo_score(tuple(trial_sorted), prefs, args)
+                    if score > best_score + 1e-6:
+                        best_score = score
+                        best_variant = trial_sorted
+            if best_variant != combo:
+                refined[idx] = list(best_variant)
+                changed = True
+        if not changed:
+            break
+
+    return [tuple(sorted(c)) for c in refined]
+
+
+def multi_start_select(df_view: pd.DataFrame, main_cols: List[str], prefs: Prefs,
+                       args, rng: np.random.Generator, seen_hist: Set[tuple]) -> List[tuple]:
+    runs = max(1, int(args.ensemble_runs))
+    best_set: Optional[List[tuple]] = None
+    best_quality = -1e18
+
+    for _ in range(runs):
+        run_rng = np.random.default_rng(rng.integers(0, 2 ** 32 - 1))
+        pool = generate_pool(df_view, main_cols, prefs, args, run_rng, seen_hist)
+        selected = select_greedy_cover(pool, df_view, main_cols, prefs, args, run_rng)
+        refined = refine_combos(selected, prefs, args, run_rng)
+        quality = set_quality(refined, prefs, args)
+        if quality > best_quality:
+            best_quality = quality
+            best_set = refined
+
+    return best_set if best_set is not None else []
+
+
 # ===================== Backtest & Auto‑Tune =====================
 
 def backtest_holdout_at_zero(df_view: pd.DataFrame, main_cols: List[str], args,
@@ -599,6 +697,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     ap.add_argument("--wheel_top", type=int, default=24, help="How many top numbers define the hot pool (default 24)")
     ap.add_argument("--wheel_min_top", type=int, default=3, help="Min from top pool per combo (default 3)")
     ap.add_argument("--wheel_min_next", type=int, default=2, help="Min from next pool per combo (default 2)")
+
+    # Multi-start & refinement controls
+    ap.add_argument("--ensemble_runs", type=int, default=3,
+                    help="How many multi-start attempts to try before picking the best set (default 3)")
+    ap.add_argument("--refine_iters", type=int, default=2,
+                    help="Local-search refinement passes per selected set (default 2; 0 disables)")
+    ap.add_argument("--refine_candidates", type=int, default=28,
+                    help="Top-N numbers (plus a few randoms) considered during refinement swaps (default 28)")
 
     # Diagnostics / Output
     ap.add_argument("--debug", action="store_true", help="Print extra info (dev use)")
@@ -717,9 +823,16 @@ def main(argv: Optional[List[str]] = None) -> None:
     # Prepare seen history (for uniqueness) on view (all except row 0 if newest first)
     seen_hist = history_seen_set(df_view, main_cols, args.num_max, args.history_cap) if not args.no_history_unique else set()
 
-    # Generate large pool then select greedily
-    pool = generate_pool(df_view, main_cols, prefs, args, rng, seen_hist)
-    combos = select_greedy_cover(pool, df_view, main_cols, prefs, args, rng)
+    # Generate suggestions using multi-start with optional refinement
+    combos = multi_start_select(df_view, main_cols, prefs, args, rng, seen_hist)
+    if not combos:
+        pool = generate_pool(df_view, main_cols, prefs, args, rng, seen_hist)
+        combos = select_greedy_cover(pool, df_view, main_cols, prefs, args, rng)
+        combos = refine_combos(combos, prefs, args, rng)
+
+    if args.debug:
+        quality = set_quality(combos, prefs, args)
+        print(f"[DEBUG] Quality={quality:.4f} avg_score={np.mean([combo_score(c, prefs, args) for c in combos]):.4f}")
 
     # Output (unchanged print behavior)
     if args.plain:
