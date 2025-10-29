@@ -9,6 +9,8 @@ Goals vs v4:
   maximize weighted coverage of hot numbers, pairs, and triplets while keeping
   high diversity between chosen combos.
 - Multi-start greedy + local-search refinement to maximize coverage quality.
+- Smarter candidate sampling with pair/trip affinity boosts and spread biasing.
+- Ensemble jitter & reuse penalties to diversify suggestions between runs.
 - Optional light AUTO‑TUNE over the last K draws to pick good knobs for your data.
 - Stronger anti‑similarity to recent draws and within‑set overlap constraints.
 - Backtest (holdout-at-0) kept and expanded.
@@ -22,7 +24,7 @@ Date: 2025-09-07
 from __future__ import annotations
 
 import argparse, sys, os, math, json, time
-from collections import Counter, defaultdict
+from collections import Counter
 from dataclasses import dataclass
 from itertools import combinations
 from pathlib import Path
@@ -336,15 +338,97 @@ def combo_score(vals: tuple, prefs: Prefs, args) -> float:
     return base - pen_consec - pen_cluster
 
 
-def sample_combo(all_nums: np.ndarray, probs: np.ndarray, rng: np.random.Generator) -> tuple:
-    chosen = []
-    mask = probs.copy()
+def _standardize_masked(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
+    vals = values[mask]
+    if vals.size <= 1:
+        values[mask] = 0.0 if vals.size == 0 else vals - vals.mean()
+        return values
+    mu = float(vals.mean())
+    sd = float(vals.std())
+    if sd < 1e-9:
+        values[mask] = vals - mu
+    else:
+        values[mask] = (vals - mu) / sd
+    return values
+
+
+def sample_combo(all_nums: np.ndarray, base_pref: np.ndarray, prefs: Prefs,
+                 args, rng: np.random.Generator) -> tuple:
+    chosen: List[int] = []
+    available = np.ones_like(all_nums, dtype=bool)
+
+    base = np.array(base_pref, dtype=float)
+    if not np.isfinite(base).all():
+        base = np.nan_to_num(base, nan=0.0, posinf=0.0, neginf=0.0)
+    if base.std() > 1e-9:
+        base = (base - base.mean()) / base.std()
+    elif base.size:
+        base = base - base.mean()
+
+    pair_boost = float(args.candidate_pair_boost)
+    trip_boost = float(args.candidate_trip_boost)
+    spread_boost = float(args.candidate_spread_boost)
+
     for _ in range(6):
-        idx = int(rng.choice(len(all_nums), p=mask))
+        logits = base.copy()
+
+        if chosen:
+            pair_scores = np.zeros_like(logits)
+            trip_scores = np.zeros_like(logits)
+            spread_scores = np.zeros_like(logits)
+            chosen_set = set(chosen)
+
+            for idx, n in enumerate(all_nums):
+                if not available[idx]:
+                    continue
+                n_int = int(n)
+                # Pair affinity with already chosen numbers
+                if pair_boost != 0.0:
+                    pair_vals = [prefs.pair.get((min(n_int, c), max(n_int, c)), 0.0) for c in chosen_set]
+                    if pair_vals:
+                        pair_scores[idx] = float(np.mean(pair_vals))
+                # Triplet affinity once at least two numbers chosen
+                if trip_boost != 0.0 and len(chosen) >= 2 and prefs.trip:
+                    trip_vals = [
+                        prefs.trip.get(tuple(sorted((n_int, a, b))), 0.0)
+                        for a, b in combinations(chosen_set, 2)
+                    ]
+                    if trip_vals:
+                        trip_scores[idx] = float(np.mean(trip_vals))
+                if spread_boost != 0.0:
+                    gap = min(abs(n_int - c) for c in chosen_set)
+                    spread_scores[idx] = gap / max(1.0, float(args.num_max))
+
+            mask = available.copy()
+            if pair_boost != 0.0:
+                logits += pair_boost * _standardize_masked(pair_scores, mask.copy())
+            if trip_boost != 0.0:
+                logits += trip_boost * _standardize_masked(trip_scores, mask.copy())
+            if spread_boost != 0.0:
+                logits += spread_boost * _standardize_masked(spread_scores, mask.copy())
+
+        logits[~available] = -np.inf
+        finite_mask = np.isfinite(logits) & available
+        if not finite_mask.any():
+            choices = np.where(available)[0]
+            idx = int(rng.choice(choices))
+        else:
+            logits = logits.copy()
+            max_logit = float(np.nanmax(logits[finite_mask]))
+            logits[finite_mask] = logits[finite_mask] - max_logit
+            weights = np.zeros_like(logits)
+            weights[finite_mask] = np.exp(np.clip(args.gamma, 0.05, 5.0) * logits[finite_mask])
+            total = weights[finite_mask].sum()
+            if total <= 0 or not np.isfinite(total):
+                choices = np.where(available)[0]
+                idx = int(rng.choice(choices))
+            else:
+                weights[finite_mask] /= total
+                idx = int(rng.choice(len(all_nums), p=weights))
+
         chosen.append(int(all_nums[idx]))
-        if mask[idx] > 0: mask[idx] = 0.0
-        s = mask.sum()
-        if s > 0: mask = mask / s
+        available[idx] = False
+
     return tuple(sorted(chosen))
 
 
@@ -352,8 +436,8 @@ def generate_pool(df_view: pd.DataFrame, main_cols: List[str], prefs: Prefs, arg
                   rng: np.random.Generator, seen_hist: Set[tuple]) -> List[tuple]:
     all_nums = np.arange(1, args.num_max + 1)
     base_w = np.array([prefs.num.get(int(n), 0.0) for n in all_nums], dtype=float)
-    probs = np.exp(args.gamma * base_w)
-    probs = probs / probs.sum() if probs.sum() > 0 else np.ones_like(probs) / len(probs)
+    if not np.isfinite(base_w).all() or base_w.sum() == 0:
+        base_w = np.nan_to_num(base_w, nan=0.0, posinf=0.0, neginf=0.0)
 
     pool: List[tuple] = []
     tries = 0
@@ -382,7 +466,7 @@ def generate_pool(df_view: pd.DataFrame, main_cols: List[str], prefs: Prefs, arg
 
     while len(pool) < args.pool and tries < args.max_tries:
         tries += 1
-        c = sample_combo(all_nums, probs, rng)
+        c = sample_combo(all_nums, base_w, prefs, args, rng)
         if args.no_history_unique is False and c in seen_hist:
             continue
         # keep a generous pool, do not apply recent similarity yet (done during final selection)
@@ -426,6 +510,7 @@ def select_greedy_cover(pool: List[tuple], df_view: pd.DataFrame, main_cols: Lis
     covered_pairs: Set[tuple] = set()
     covered_trips: Set[tuple] = set()
     selected: List[tuple] = []
+    usage_counts: Counter = Counter()
 
     cw = CoverWeights(num=args.cw_num, pair=args.cw_pair, trip=args.cw_trip)
 
@@ -447,6 +532,8 @@ def select_greedy_cover(pool: List[tuple], df_view: pd.DataFrame, main_cols: Lis
 
     # Greedy add
     tries = 0
+    usage_target = max(1, int(getattr(args, "cover_usage_target", 1)))
+    usage_penalty = float(getattr(args, "cover_usage_penalty", 0.0))
     while len(selected) < args.total_needed and pool and tries < (len(pool) * 4):
         tries += 1
         # Evaluate marginal gain for all remaining
@@ -458,6 +545,10 @@ def select_greedy_cover(pool: List[tuple], df_view: pd.DataFrame, main_cols: Lis
             mg = marginal_gain(c, covered_nums, covered_pairs, covered_trips, cw, prefs)
             # small addition: include base score so we don't select purely for coverage
             val = mg + args.cover_base_mix * base_scores[c]
+            if usage_penalty > 0.0:
+                repeat = sum(max(0, usage_counts[v] - usage_target + 1) for v in c)
+                if repeat:
+                    val -= usage_penalty * repeat
             if val > best_val:
                 best_val, best_c = val, c
         if best_c is None:
@@ -469,6 +560,8 @@ def select_greedy_cover(pool: List[tuple], df_view: pd.DataFrame, main_cols: Lis
         for a,b in combinations(best_c, 2): covered_pairs.add((min(a,b), max(a,b)))
         if prefs.trip:
             for t in combinations(best_c, 3): covered_trips.add(tuple(sorted(t)))
+        for v in best_c:
+            usage_counts[v] += 1
         # remove chosen from pool
         pool.remove(best_c)
 
@@ -478,7 +571,13 @@ def select_greedy_cover(pool: List[tuple], df_view: pd.DataFrame, main_cols: Lis
         for c in leftovers:
             if any(len(set(c) & set(s)) >= args.dedupe_k for s in selected): 
                 continue
+            if usage_penalty > 0.0:
+                repeat = sum(max(0, usage_counts[v] - usage_target + 1) for v in c)
+                if repeat:
+                    continue
             selected.append(c)
+            for v in c:
+                usage_counts[v] += 1
             if len(selected) >= args.total_needed: break
 
     return selected[:args.total_needed]
@@ -509,11 +608,19 @@ def set_quality(combos: List[tuple], prefs: Prefs, args) -> float:
                     / max(1, len(covered_trips)))
     spread_bonus = float(np.mean([(max(c) - min(c)) / max(1.0, args.num_max) for c in combos]))
 
+    usage_penalty = float(getattr(args, "cover_usage_penalty", 0.0))
+    usage_target = max(1, int(getattr(args, "cover_usage_target", 1)))
+    repeat_penalty = 0.0
+    if usage_penalty > 0.0:
+        counts = Counter(v for c in combos for v in c)
+        repeat_penalty = usage_penalty * sum(max(0, cnt - usage_target) for cnt in counts.values()) * 0.6
+
     return (avg_score
             + 0.45 * cov_num
             + 0.30 * cov_pair
             + (0.20 * cov_trip if prefs.trip else 0.0)
-            + 0.05 * spread_bonus)
+            + 0.05 * spread_bonus
+            - repeat_penalty)
 
 
 def refine_combos(combos: List[tuple], prefs: Prefs, args, rng: np.random.Generator) -> List[tuple]:
@@ -570,10 +677,20 @@ def multi_start_select(df_view: pd.DataFrame, main_cols: List[str], prefs: Prefs
 
     for _ in range(runs):
         run_rng = np.random.default_rng(rng.integers(0, 2 ** 32 - 1))
-        pool = generate_pool(df_view, main_cols, prefs, args, run_rng, seen_hist)
-        selected = select_greedy_cover(pool, df_view, main_cols, prefs, args, run_rng)
-        refined = refine_combos(selected, prefs, args, run_rng)
-        quality = set_quality(refined, prefs, args)
+        run_args = argparse.Namespace(**vars(args))
+        jitter = float(getattr(args, "ensemble_jitter", 0.0))
+        if jitter > 0.0:
+            jitter_norm = lambda scale: float(run_rng.normal(0.0, jitter * scale))
+            run_args.gamma = max(0.35, args.gamma * (1.0 + jitter_norm(1.0)))
+            run_args.cover_base_mix = float(np.clip(args.cover_base_mix + jitter_norm(0.6), 0.0, 1.0))
+            run_args.candidate_pair_boost = max(0.0, args.candidate_pair_boost * (1.0 + jitter_norm(0.8)))
+            run_args.candidate_trip_boost = max(0.0, args.candidate_trip_boost * (1.0 + jitter_norm(0.8)))
+            run_args.candidate_spread_boost = max(0.0, args.candidate_spread_boost * (1.0 + jitter_norm(0.7)))
+            run_args.cover_usage_penalty = max(0.0, args.cover_usage_penalty * (1.0 + jitter_norm(0.5)))
+        pool = generate_pool(df_view, main_cols, prefs, run_args, run_rng, seen_hist)
+        selected = select_greedy_cover(pool, df_view, main_cols, prefs, run_args, run_rng)
+        refined = refine_combos(selected, prefs, run_args, run_rng)
+        quality = set_quality(refined, prefs, run_args)
         if quality > best_quality:
             best_quality = quality
             best_set = refined
@@ -684,12 +801,16 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     ap.add_argument("--w_sum", type=float, default=0.03, help="Weight for sum gaussian proximity")
     ap.add_argument("--w_par", type=float, default=0.02, help="Weight for parity target proximity")
     ap.add_argument("--w_wait", type=float, default=0.15, help="Weight for waiting-time preference")
-    
+
     # Selection coverage mixing
     ap.add_argument("--cw_num", type=float, default=0.8, help="Coverage weight for numbers")
     ap.add_argument("--cw_pair", type=float, default=2.5, help="Coverage weight for pairs")
     ap.add_argument("--cw_trip", type=float, default=5.0, help="Coverage weight for triplets")
     ap.add_argument("--cover_base_mix", type=float, default=0.45, help="Mix-in of base score during coverage selection (0..1)")
+    ap.add_argument("--cover_usage_penalty", type=float, default=0.08,
+                    help="Penalty applied when a number is reused beyond cover_usage_target across the suggested set")
+    ap.add_argument("--cover_usage_target", type=int, default=1,
+                    help="How many times a number can appear across the set before the reuse penalty activates")
 
 
     # Wheel coverage for hot pools
@@ -698,6 +819,14 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     ap.add_argument("--wheel_min_top", type=int, default=3, help="Min from top pool per combo (default 3)")
     ap.add_argument("--wheel_min_next", type=int, default=2, help="Min from next pool per combo (default 2)")
 
+    # Candidate sampling tweaks
+    ap.add_argument("--candidate_pair_boost", type=float, default=0.45,
+                    help="Strength of pair-affinity boost during candidate sampling")
+    ap.add_argument("--candidate_trip_boost", type=float, default=0.25,
+                    help="Strength of triplet-affinity boost during candidate sampling")
+    ap.add_argument("--candidate_spread_boost", type=float, default=0.12,
+                    help="Encourage wider number spread during candidate sampling")
+
     # Multi-start & refinement controls
     ap.add_argument("--ensemble_runs", type=int, default=3,
                     help="How many multi-start attempts to try before picking the best set (default 3)")
@@ -705,6 +834,8 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                     help="Local-search refinement passes per selected set (default 2; 0 disables)")
     ap.add_argument("--refine_candidates", type=int, default=28,
                     help="Top-N numbers (plus a few randoms) considered during refinement swaps (default 28)")
+    ap.add_argument("--ensemble_jitter", type=float, default=0.15,
+                    help="Standard deviation for random jitters applied to sampling/selection weights across ensemble runs (0 disables)")
 
     # Diagnostics / Output
     ap.add_argument("--debug", action="store_true", help="Print extra info (dev use)")
