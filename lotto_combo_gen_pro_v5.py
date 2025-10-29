@@ -11,6 +11,8 @@ Goals vs v4:
 - Multi-start greedy + local-search refinement to maximize coverage quality.
 - Smarter candidate sampling with pair/trip affinity boosts and spread biasing.
 - Ensemble jitter & reuse penalties to diversify suggestions between runs.
+- Momentum & novelty controls to track trend changes and aggressively block
+  recycled combos that keep reappearing in recent history.
 - Optional light AUTO‑TUNE over the last K draws to pick good knobs for your data.
 - Stronger anti‑similarity to recent draws and within‑set overlap constraints.
 - Backtest (holdout-at-0) kept and expanded.
@@ -225,6 +227,73 @@ def waiting_time_pref(df_num: pd.DataFrame, main_cols: List[str], num_max: int, 
     return zscore_counter(gaps)
 
 
+def number_momentum_pref(df_num: pd.DataFrame, main_cols: List[str], num_max: int,
+                         short: int, long: int) -> Dict[int, float]:
+    if short <= 0 or long <= 0:
+        return {}
+    long = max(long, short)
+    hist = df_num.loc[:, main_cols].dropna(how="any")
+    if hist.empty:
+        return {}
+
+    def window_counter(limit: int) -> Counter:
+        subset = hist.iloc[:min(limit, len(hist))]
+        freq = Counter()
+        for _, r in subset.iterrows():
+            vals = [int(x) for x in r[main_cols].tolist() if pd.notna(x)]
+            vals = [v for v in vals if 1 <= v <= num_max]
+            if len(vals) >= 6:
+                freq.update(vals)
+        return freq
+
+    short_cnt = window_counter(short)
+    long_cnt = window_counter(long)
+    if not short_cnt and not long_cnt:
+        return {}
+
+    draws_short = max(1, min(short, len(hist)))
+    draws_long = max(draws_short, min(long, len(hist)))
+    diff = {}
+    for n in range(1, num_max + 1):
+        short_rate = short_cnt.get(n, 0) / draws_short
+        long_rate = long_cnt.get(n, 0) / draws_long
+        diff[n] = float(short_rate - long_rate)
+    return zscore_counter(diff)
+
+
+def recent_hot_penalty(df_num: pd.DataFrame, main_cols: List[str], num_max: int,
+                       window: int) -> Dict[int, float]:
+    if window <= 0:
+        return {}
+    hist = df_num.loc[:min(window, len(df_num)) - 1, main_cols].dropna(how="any")
+    if hist.empty:
+        return {}
+    freq = Counter()
+    for _, r in hist.iterrows():
+        vals = [int(x) for x in r[main_cols].tolist() if pd.notna(x)]
+        vals = [v for v in vals if 1 <= v <= num_max]
+        if len(vals) >= 6:
+            freq.update(vals)
+    if not freq:
+        return {}
+    penalty = zscore_counter(freq)
+    return {k: max(0.0, v) for k, v in penalty.items()}
+
+
+def recent_combo_counts(df_num: pd.DataFrame, main_cols: List[str], num_max: int,
+                        window: int) -> Dict[tuple, int]:
+    if window <= 0:
+        return {}
+    hist = df_num.loc[:min(window, len(df_num)) - 1, main_cols].dropna(how="any")
+    counts: Counter = Counter()
+    for _, r in hist.iterrows():
+        vals = [int(x) for x in r[main_cols].tolist() if pd.notna(x)]
+        vals = [v for v in vals if 1 <= v <= num_max]
+        if len(vals) >= 6:
+            counts[tuple(sorted(vals[:6]))] += 1
+    return dict(counts)
+
+
 # ===================== Candidate Generation =====================
 
 def history_seen_set(df_num: pd.DataFrame, main_cols: List[str], num_max: int,
@@ -260,6 +329,9 @@ class Prefs:
     sum_mu: float
     sum_sd: float
     wait: Dict[int, float]
+    momentum: Dict[int, float]
+    hot_penalty: Dict[int, float]
+    combo_counts: Dict[tuple, int]
 
 
 def build_prefs(df_view: pd.DataFrame, main_cols: List[str], args) -> Prefs:
@@ -301,8 +373,29 @@ def build_prefs(df_view: pd.DataFrame, main_cols: List[str], args) -> Prefs:
 
     wait_pref = waiting_time_pref(df_view, main_cols, args.num_max, args.history_cap) if args.w_wait > 0 else {}
 
+    momentum_pref = {}
+    if getattr(args, "w_momentum", 0.0) > 0.0 or getattr(args, "sample_momentum", 0.0) != 0.0:
+        momentum_pref = number_momentum_pref(
+            df_view, main_cols, args.num_max,
+            max(1, int(getattr(args, "momentum_short", 60))),
+            max(1, int(getattr(args, "momentum_long", 360)))
+        )
+
+    hot_pen = {}
+    if getattr(args, "recent_hot_penalty", 0.0) > 0.0 or getattr(args, "sample_recent_hot", 0.0) != 0.0:
+        hot_pen = recent_hot_penalty(
+            df_view, main_cols, args.num_max,
+            max(1, int(getattr(args, "recent_hot_window", 40)))
+        )
+
+    combo_counts = recent_combo_counts(
+        df_view, main_cols, args.num_max,
+        max(1, int(getattr(args, "novelty_window", 220)))
+    ) if getattr(args, "penalty_seen", 0.0) > 0.0 or getattr(args, "novelty_soft_limit", 0) >= 0 else {}
+
     return Prefs(num=num_pref, pair=pair_pref, trip=trip_pref,
-                 even_target=even_target, sum_mu=sum_mu, sum_sd=sum_sd, wait=wait_pref)
+                 even_target=even_target, sum_mu=sum_mu, sum_sd=sum_sd, wait=wait_pref,
+                 momentum=momentum_pref, hot_penalty=hot_pen, combo_counts=combo_counts)
 
 
 def combo_score(vals: tuple, prefs: Prefs, args) -> float:
@@ -322,6 +415,10 @@ def combo_score(vals: tuple, prefs: Prefs, args) -> float:
     s_sum = math.exp(-((sum(vals) - prefs.sum_mu) ** 2) / (2 * (prefs.sum_sd ** 2)))
     # waiting time
     s_wait = float(np.mean([prefs.wait.get(v, 0.0) for v in vals])) if prefs.wait else 0.0
+    s_mom = float(np.mean([prefs.momentum.get(v, 0.0) for v in vals])) if getattr(prefs, "momentum", None) else 0.0
+    hot_mean = float(np.mean([prefs.hot_penalty.get(v, 0.0) for v in vals])) if getattr(prefs, "hot_penalty", None) else 0.0
+    combo_seen = prefs.combo_counts.get(vals, 0) if getattr(prefs, "combo_counts", None) else 0
+
     # adjacency penalties (avoid too many consecutive numbers or tight clusters)
     consec = sum(1 for a,b in zip(vals, vals[1:]) if b == a+1)
     spread = max(vals) - min(vals)
@@ -333,9 +430,13 @@ def combo_score(vals: tuple, prefs: Prefs, args) -> float:
             + (args.w_trip * s_trip if args.use_triplets else 0.0)
             + args.w_sum  * s_sum
             + args.w_par  * s_par
-            + args.w_wait * s_wait)
+            + args.w_wait * s_wait
+            + getattr(args, "w_momentum", 0.0) * s_mom)
 
-    return base - pen_consec - pen_cluster
+    penalty_hot = getattr(args, "recent_hot_penalty", 0.0) * hot_mean
+    penalty_seen = getattr(args, "penalty_seen", 0.0) * math.log1p(max(0, combo_seen))
+
+    return base - pen_consec - pen_cluster - penalty_hot - penalty_seen
 
 
 def _standardize_masked(values: np.ndarray, mask: np.ndarray) -> np.ndarray:
@@ -435,7 +536,17 @@ def sample_combo(all_nums: np.ndarray, base_pref: np.ndarray, prefs: Prefs,
 def generate_pool(df_view: pd.DataFrame, main_cols: List[str], prefs: Prefs, args,
                   rng: np.random.Generator, seen_hist: Set[tuple]) -> List[tuple]:
     all_nums = np.arange(1, args.num_max + 1)
-    base_w = np.array([prefs.num.get(int(n), 0.0) for n in all_nums], dtype=float)
+    base_vals = []
+    for n in all_nums:
+        v = prefs.num.get(int(n), 0.0)
+        if getattr(args, "sample_momentum", 0.0) != 0.0 and prefs.momentum:
+            v += float(args.sample_momentum) * prefs.momentum.get(int(n), 0.0)
+        if getattr(args, "sample_wait", 0.0) != 0.0 and prefs.wait:
+            v += float(args.sample_wait) * prefs.wait.get(int(n), 0.0)
+        if getattr(args, "sample_recent_hot", 0.0) != 0.0 and prefs.hot_penalty:
+            v -= float(args.sample_recent_hot) * prefs.hot_penalty.get(int(n), 0.0)
+        base_vals.append(v)
+    base_w = np.array(base_vals, dtype=float)
     if not np.isfinite(base_w).all() or base_w.sum() == 0:
         base_w = np.nan_to_num(base_w, nan=0.0, posinf=0.0, neginf=0.0)
 
@@ -523,9 +634,12 @@ def select_greedy_cover(pool: List[tuple], df_view: pd.DataFrame, main_cols: Lis
         if args.recent_block_k > 0 and too_similar_to_recent(c, df_view, main_cols, args.num_max,
                                                              recent_m=args.recent_block_m, k=args.recent_block_k):
             continue
+        if getattr(args, "novelty_soft_limit", None) is not None and getattr(prefs, "combo_counts", None):
+            if prefs.combo_counts.get(c, 0) > max(0, int(args.novelty_soft_limit)):
+                continue
         # light constraint: avoid 3 or more consecutive numbers in a combo
         consec = sum(1 for a,b in zip(c, c[1:]) if b == a+1)
-        if consec >= 3: 
+        if consec >= 3:
             continue
         filt_pool.append(c)
     pool = filt_pool if filt_pool else pool
@@ -607,6 +721,17 @@ def set_quality(combos: List[tuple], prefs: Prefs, args) -> float:
         cov_trip = (sum(max(0.0, prefs.trip.get(t, 0.0)) for t in covered_trips)
                     / max(1, len(covered_trips)))
     spread_bonus = float(np.mean([(max(c) - min(c)) / max(1.0, args.num_max) for c in combos]))
+    mom_bonus = 0.0
+    if getattr(args, "w_momentum", 0.0) > 0.0 and getattr(prefs, "momentum", None):
+        mom_bonus = float(np.mean([prefs.momentum.get(v, 0.0) for c in combos for v in c]))
+    hot_penalty = 0.0
+    if getattr(args, "recent_hot_penalty", 0.0) > 0.0 and getattr(prefs, "hot_penalty", None):
+        hot_penalty = getattr(args, "recent_hot_penalty", 0.0) * float(np.mean([prefs.hot_penalty.get(v, 0.0) for c in combos for v in c]))
+    novelty_penalty = 0.0
+    if getattr(args, "penalty_seen", 0.0) > 0.0 and getattr(prefs, "combo_counts", None):
+        novelty_penalty = getattr(args, "penalty_seen", 0.0) * float(np.mean([
+            math.log1p(max(0, prefs.combo_counts.get(tuple(sorted(c)), 0))) for c in combos
+        ]))
 
     usage_penalty = float(getattr(args, "cover_usage_penalty", 0.0))
     usage_target = max(1, int(getattr(args, "cover_usage_target", 1)))
@@ -620,7 +745,10 @@ def set_quality(combos: List[tuple], prefs: Prefs, args) -> float:
             + 0.30 * cov_pair
             + (0.20 * cov_trip if prefs.trip else 0.0)
             + 0.05 * spread_bonus
-            - repeat_penalty)
+            + 0.08 * mom_bonus
+            - repeat_penalty
+            - hot_penalty
+            - novelty_penalty)
 
 
 def refine_combos(combos: List[tuple], prefs: Prefs, args, rng: np.random.Generator) -> List[tuple]:
@@ -687,6 +815,11 @@ def multi_start_select(df_view: pd.DataFrame, main_cols: List[str], prefs: Prefs
             run_args.candidate_trip_boost = max(0.0, args.candidate_trip_boost * (1.0 + jitter_norm(0.8)))
             run_args.candidate_spread_boost = max(0.0, args.candidate_spread_boost * (1.0 + jitter_norm(0.7)))
             run_args.cover_usage_penalty = max(0.0, args.cover_usage_penalty * (1.0 + jitter_norm(0.5)))
+            run_args.sample_momentum = max(0.0, args.sample_momentum * (1.0 + jitter_norm(0.6)))
+            run_args.sample_wait = max(0.0, args.sample_wait * (1.0 + jitter_norm(0.5)))
+            run_args.sample_recent_hot = max(0.0, args.sample_recent_hot * (1.0 + jitter_norm(0.5)))
+            run_args.w_momentum = max(0.0, args.w_momentum * (1.0 + jitter_norm(0.4)))
+            run_args.recent_hot_penalty = max(0.0, args.recent_hot_penalty * (1.0 + jitter_norm(0.4)))
         pool = generate_pool(df_view, main_cols, prefs, run_args, run_rng, seen_hist)
         selected = select_greedy_cover(pool, df_view, main_cols, prefs, run_args, run_rng)
         refined = refine_combos(selected, prefs, run_args, run_rng)
@@ -801,6 +934,22 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
     ap.add_argument("--w_sum", type=float, default=0.03, help="Weight for sum gaussian proximity")
     ap.add_argument("--w_par", type=float, default=0.02, help="Weight for parity target proximity")
     ap.add_argument("--w_wait", type=float, default=0.15, help="Weight for waiting-time preference")
+    ap.add_argument("--w_momentum", type=float, default=0.18,
+                    help="Weight for short-vs-long frequency momentum during scoring")
+    ap.add_argument("--momentum_short", type=int, default=60,
+                    help="How many recent draws define the short momentum window")
+    ap.add_argument("--momentum_long", type=int, default=360,
+                    help="How many draws define the long momentum baseline")
+    ap.add_argument("--recent_hot_penalty", type=float, default=0.35,
+                    help="Penalty applied when combos lean too hard on the hottest recent numbers")
+    ap.add_argument("--recent_hot_window", type=int, default=40,
+                    help="How many draws to inspect for recent-hot penalties")
+    ap.add_argument("--penalty_seen", type=float, default=0.65,
+                    help="Penalty strength for combos that already appeared in the recent history window")
+    ap.add_argument("--novelty_window", type=int, default=220,
+                    help="Recent history span (in draws) inspected for combo reuse penalties")
+    ap.add_argument("--novelty_soft_limit", type=int, default=1,
+                    help="If a candidate combo appeared more than this many times recently it is discarded before selection")
 
     # Selection coverage mixing
     ap.add_argument("--cw_num", type=float, default=0.8, help="Coverage weight for numbers")
@@ -826,6 +975,12 @@ def parse_args(argv: Optional[List[str]] = None) -> argparse.Namespace:
                     help="Strength of triplet-affinity boost during candidate sampling")
     ap.add_argument("--candidate_spread_boost", type=float, default=0.12,
                     help="Encourage wider number spread during candidate sampling")
+    ap.add_argument("--sample_momentum", type=float, default=0.55,
+                    help="Boost factor for number momentum when sampling candidates")
+    ap.add_argument("--sample_wait", type=float, default=0.35,
+                    help="Boost factor for waiting-time z-scores during sampling")
+    ap.add_argument("--sample_recent_hot", type=float, default=0.45,
+                    help="Penalty factor for overly hot recent numbers during sampling")
 
     # Multi-start & refinement controls
     ap.add_argument("--ensemble_runs", type=int, default=3,
